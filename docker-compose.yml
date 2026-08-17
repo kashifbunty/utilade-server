@@ -1,0 +1,79 @@
+# The Utilade conversion service.
+#
+# Run from /opt/utilade on the VPS. This box already serves another production site
+# with paying customers on it, so every limit below is deliberate: a Utilade
+# traffic spike is stopped by the kernel long before anyone using that site
+# notices anything.
+
+services:
+  convert:
+    build: ./service
+    container_name: utilade-convert
+    restart: unless-stopped
+
+    # Localhost only. The internet reaches this through nginx and Cloudflare or
+    # not at all — binding 0.0.0.0 here would quietly make the rate limiting
+    # optional.
+    ports:
+      - "127.0.0.1:8081:8081"
+
+    # Killed by the kernel rather than by someone else's customers noticing. A
+    # LibreOffice process handed a malformed file can grow without limit; this
+    # is the line where that stops being everyone's problem.
+    # Two LibreOffice processes are roughly 400 MB each, and the RAM disk below
+    # counts against this same budget — so 2g is the working figure, not a
+    # guess. There is comfortable headroom either way, and the cap is what guarantees it.
+    # 2g is ample for LibreOffice and pdf2docx. It was 3 while an ML engine was
+    # being tried; that engine is gone, so the box gets the gigabyte back.
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: 1.5
+    pids_limit: 512
+
+    # Nothing is kept, so nothing needs to survive a restart. tmpfs also means
+    # a crash cannot leave a stranger's document on the disk.
+    tmpfs:
+      - /tmp:size=768m,mode=1777
+    read_only: true
+
+    # The AI models, in a volume rather than only in the image.
+    #
+    # Docker fills a fresh named volume from the image's own copy of the path,
+    # so the models baked in at build time are still there on first run — but
+    # the directory is now writable, which means a model the build failed to
+    # fetch can be fetched once at run time instead of failing for ever. The
+    # rest of the container stays read-only.
+    volumes:
+      - models:/opt/models
+
+    security_opt:
+      - no-new-privileges:true
+
+    environment:
+      PORT: 8081
+      # Two at a time, matching the plan. Raising this is not a small change:
+      # it is the number that decides whether a spike stays inside its fence.
+      MAX_CONCURRENT: 2
+      # 90s, not 60 and not 300.
+      #
+      # Cloudflare's free plan stops waiting for an origin at 100 seconds, so a
+      # job allowed to run longer than that cannot deliver its answer to anyone
+      # — it just burns a slot and returns a gateway error. 90 leaves room to
+      # send our own, better message first.
+      JOB_TIMEOUT_MS: 90000
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8081/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  models:
